@@ -12,7 +12,7 @@ const router = express.Router()
 const JWT_SECRET = process.env.JWT_SECRET
 if (!JWT_SECRET) throw new Error('JWT_SECRET not set')
 
-const uploadDir = fileURLToPath(new URL('../../../public/uploads/', import.meta.url))
+const uploadDir = fileURLToPath(new URL('../../public/uploads/', import.meta.url))
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024, files: 2, fields: 20, parts: 24 },
