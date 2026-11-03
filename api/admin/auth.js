@@ -7,6 +7,7 @@ import { getDB } from '../../lib/db.js'
 const router = express.Router()
 const JWT_SECRET = process.env.JWT_SECRET
 if (!JWT_SECRET) throw new Error('JWT_SECRET not set')
+const ADMIN_REGISTER_KEY = process.env.ADMIN_REGISTER_KEY
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 5,
@@ -25,6 +26,11 @@ const cookieOptions = {
 
 router.post('/register', authLimiter, async (req, res) => {
   try {
+    if (!ADMIN_REGISTER_KEY)
+      return res.status(503).json({ ok: false, message: 'Admin registration is not configured' })
+    if (req.body?.registrationKey !== ADMIN_REGISTER_KEY)
+      return res.status(403).json({ ok: false, message: 'Invalid registration key' })
+
     const { username, password } = req.body
     if (!username?.trim()) return res.status(400).json({ ok: false, message: 'Username required' })
     if (username.trim().length < 3 || username.trim().length > 64)
