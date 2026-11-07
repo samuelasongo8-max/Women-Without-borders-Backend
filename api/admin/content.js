@@ -7,6 +7,11 @@ import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import { ObjectId } from 'mongodb'
 import { getDB } from '../../lib/db.js'
+import {
+  communityContentExcerpt,
+  hasCommunityContent,
+  sanitizeCommunityContent,
+} from '../../lib/communityContent.js'
 
 const router = express.Router()
 const JWT_SECRET = process.env.JWT_SECRET
@@ -250,25 +255,37 @@ router.delete('/reports/:id', requireAdmin, async (req, res) => {
   }
 })
 
-router.post('/updates', requireAdmin, async (req, res) => {
+router.post('/updates', requireAdmin, upload.array('images', 2), async (req, res) => {
   const { title, update, excerpt, category, coverImageLink, author } = req.body || {}
-  if (!title?.trim() || !update?.trim()) {
+  const safeUpdate = sanitizeCommunityContent(update)
+  if (!title?.trim() || !hasCommunityContent(safeUpdate)) {
     return res.status(400).json({ ok: false, message: 'Title and update content required' })
   }
+  if (!validateImages(req.files || [])) {
+    return res.status(400).json({ ok: false, message: 'Upload valid JPG, PNG, GIF, or WEBP images' })
+  }
+  const savedImages = []
   try {
     const db = await getDB()
+    for (const file of req.files || []) {
+      savedImages.push(await saveImage(file))
+    }
+    const images = savedImages.map((image) => image.url)
     await db.collection(collections.updates).insertOne({
       title: title.trim(),
-      update: update.trim(),
-      excerpt: excerpt?.trim() || update.trim().substring(0, 120),
+      update: safeUpdate,
+      excerpt: excerpt?.trim() || communityContentExcerpt(safeUpdate),
       category: category?.trim() || 'Community',
-      coverImageLink: coverImageLink?.trim() || '',
+      coverImageLink: images[0] || coverImageLink?.trim() || '',
+      images,
       author: author?.trim() || '',
       createdAt: new Date(),
+      publishedAt: new Date(),
       createdBy: req.admin.username,
     })
     res.status(201).json({ ok: true, message: 'Community update posted' })
   } catch (error) {
+    await removeSavedImages(savedImages)
     logFailure('updates', error)
     res.status(500).json({ ok: false, message: 'Unable to save community update' })
   }
@@ -295,6 +312,59 @@ router.delete('/updates/:id', requireAdmin, async (req, res) => {
   } catch (error) {
     logFailure('updates', error)
     res.status(500).json({ ok: false, message: 'Unable to delete community update' })
+  }
+})
+
+router.put('/updates/:id', requireAdmin, upload.array('images', 2), async (req, res) => {
+  if (!ObjectId.isValid(req.params.id)) return res.status(400).json({ ok: false, message: 'Invalid update ID' })
+  const { title, update, excerpt, category, coverImageLink, author } = req.body || {}
+  const safeUpdate = sanitizeCommunityContent(update)
+  if (!title?.trim() || !hasCommunityContent(safeUpdate)) {
+    return res.status(400).json({ ok: false, message: 'Title and update content required' })
+  }
+  if (!validateImages(req.files || [])) {
+    return res.status(400).json({ ok: false, message: 'Upload valid JPG, PNG, GIF, or WEBP images' })
+  }
+
+  const savedImages = []
+  try {
+    const db = await getDB()
+    const collection = db.collection(collections.updates)
+    const current = await collection.findOne({ _id: new ObjectId(req.params.id) })
+    if (!current) return res.status(404).json({ ok: false, message: 'Update not found' })
+
+    for (const file of req.files || []) {
+      savedImages.push(await saveImage(file))
+    }
+    const imageUrls = savedImages.length
+      ? savedImages.map((image) => image.url)
+      : (coverImageLink?.trim() && coverImageLink.trim() !== current.coverImageLink
+        ? [coverImageLink.trim(), ...(current.images || []).filter((image) => image !== current.coverImageLink)]
+        : (current.images || []))
+    const result = await collection.updateOne(
+      { _id: new ObjectId(req.params.id) },
+      {
+        $set: {
+          title: title.trim(),
+          update: safeUpdate,
+          excerpt: excerpt?.trim() || communityContentExcerpt(safeUpdate),
+          category: category?.trim() || 'Community',
+          coverImageLink: savedImages[0]?.url || coverImageLink?.trim() || '',
+          images: imageUrls,
+          author: author?.trim() || '',
+          updatedAt: new Date(),
+        },
+      },
+    )
+    if (!result.matchedCount) {
+      await removeSavedImages(savedImages)
+      return res.status(404).json({ ok: false, message: 'Update not found' })
+    }
+    res.json({ ok: true, message: 'Community update updated' })
+  } catch (error) {
+    await removeSavedImages(savedImages)
+    logFailure('updates', error)
+    res.status(500).json({ ok: false, message: 'Unable to update community update' })
   }
 })
 
