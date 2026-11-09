@@ -1,5 +1,4 @@
 import express from 'express'
-import jwt from 'jsonwebtoken'
 import multer from 'multer'
 import { randomUUID } from 'node:crypto'
 import { mkdir, unlink, writeFile } from 'node:fs/promises'
@@ -7,13 +6,13 @@ import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import { ObjectId } from 'mongodb'
 import { getDB } from '../../lib/db.js'
+import { createRequireAdmin } from '../../lib/adminSession.js'
 import {
   communityContentExcerpt,
   hasCommunityContent,
   sanitizeCommunityContent,
 } from '../../lib/communityContent.js'
 
-const router = express.Router()
 const JWT_SECRET = process.env.JWT_SECRET
 if (!JWT_SECRET) throw new Error('JWT_SECRET not set')
 
@@ -28,18 +27,6 @@ const collections = {
   blogs: 'blogs',
   reports: 'reports',
   updates: 'community_updates',
-}
-
-function requireAdmin(req, res, next) {
-  const token = req.cookies?.adminToken
-  if (!token) return res.status(401).json({ ok: false, message: 'Not authenticated' })
-
-  try {
-    req.admin = jwt.verify(token, JWT_SECRET)
-    next()
-  } catch {
-    res.status(401).json({ ok: false, message: 'Session expired' })
-  }
 }
 
 function imageExtension(file) {
@@ -86,6 +73,10 @@ function logFailure(label, error) {
   console.error(`[${label}] Error:`, error.message)
 }
 
+export function createAdminContentRouter({ getDBFn = getDB, jwtSecret = JWT_SECRET } = {}) {
+const router = express.Router()
+const requireAdmin = createRequireAdmin({ getDBFn, jwtSecret })
+
 router.post('/posts', requireAdmin, upload.single('featuredImage'), async (req, res) => {
   const { date, topic, altText, caption, paragraph } = req.body || {}
   if (!date || !topic?.trim() || !paragraph?.trim()) {
@@ -97,7 +88,7 @@ router.post('/posts', requireAdmin, upload.single('featuredImage'), async (req, 
 
   const savedImages = []
   try {
-    const db = await getDB()
+    const db = await getDBFn()
     const image = req.file ? await saveImage(req.file) : null
     if (image) savedImages.push(image)
     await db.collection(collections.posts).insertOne({
@@ -120,7 +111,7 @@ router.post('/posts', requireAdmin, upload.single('featuredImage'), async (req, 
 
 router.get('/posts', requireAdmin, async (_req, res) => {
   try {
-    const db = await getDB()
+    const db = await getDBFn()
     const posts = await db.collection(collections.posts).find({}).sort({ createdAt: -1 }).toArray()
     res.json({ ok: true, posts })
   } catch (error) {
@@ -132,7 +123,7 @@ router.get('/posts', requireAdmin, async (_req, res) => {
 router.delete('/posts/:id', requireAdmin, async (req, res) => {
   if (!ObjectId.isValid(req.params.id)) return res.status(400).json({ ok: false, message: 'Invalid post ID' })
   try {
-    const db = await getDB()
+    const db = await getDBFn()
     const result = await db.collection(collections.posts).deleteOne({ _id: new ObjectId(req.params.id) })
     if (!result.deletedCount) return res.status(404).json({ ok: false, message: 'Post not found' })
     res.json({ ok: true, message: 'Post deleted' })
@@ -158,7 +149,7 @@ router.post(
 
     const savedImages = []
     try {
-      const db = await getDB()
+      const db = await getDBFn()
       const blogImage = req.files?.blogImage?.[0] ? await saveImage(req.files.blogImage[0]) : null
       if (blogImage) savedImages.push(blogImage)
       const contentImage = req.files?.contentImage?.[0] ? await saveImage(req.files.contentImage[0]) : null
@@ -184,7 +175,7 @@ router.post(
 
 router.get('/blogs', requireAdmin, async (_req, res) => {
   try {
-    const db = await getDB()
+    const db = await getDBFn()
     const blogs = await db.collection(collections.blogs).find({}).sort({ createdAt: -1 }).toArray()
     res.json({ ok: true, blogs })
   } catch (error) {
@@ -196,7 +187,7 @@ router.get('/blogs', requireAdmin, async (_req, res) => {
 router.delete('/blogs/:id', requireAdmin, async (req, res) => {
   if (!ObjectId.isValid(req.params.id)) return res.status(400).json({ ok: false, message: 'Invalid blog ID' })
   try {
-    const db = await getDB()
+    const db = await getDBFn()
     const result = await db.collection(collections.blogs).deleteOne({ _id: new ObjectId(req.params.id) })
     if (!result.deletedCount) return res.status(404).json({ ok: false, message: 'Blog not found' })
     res.json({ ok: true, message: 'Blog deleted' })
@@ -212,7 +203,7 @@ router.post('/reports', requireAdmin, async (req, res) => {
     return res.status(400).json({ ok: false, message: 'Title, category, date and file link required' })
   }
   try {
-    const db = await getDB()
+    const db = await getDBFn()
     await db.collection(collections.reports).insertOne({
       reportTitle: reportTitle.trim(),
       coverImageLink: coverImageLink?.trim() || '',
@@ -233,7 +224,7 @@ router.post('/reports', requireAdmin, async (req, res) => {
 
 router.get('/reports', requireAdmin, async (_req, res) => {
   try {
-    const db = await getDB()
+    const db = await getDBFn()
     const reports = await db.collection(collections.reports).find({}).sort({ createdAt: -1 }).toArray()
     res.json({ ok: true, reports })
   } catch (error) {
@@ -245,7 +236,7 @@ router.get('/reports', requireAdmin, async (_req, res) => {
 router.delete('/reports/:id', requireAdmin, async (req, res) => {
   if (!ObjectId.isValid(req.params.id)) return res.status(400).json({ ok: false, message: 'Invalid report ID' })
   try {
-    const db = await getDB()
+    const db = await getDBFn()
     const result = await db.collection(collections.reports).deleteOne({ _id: new ObjectId(req.params.id) })
     if (!result.deletedCount) return res.status(404).json({ ok: false, message: 'Report not found' })
     res.json({ ok: true, message: 'Report deleted' })
@@ -266,7 +257,7 @@ router.post('/updates', requireAdmin, upload.array('images', 2), async (req, res
   }
   const savedImages = []
   try {
-    const db = await getDB()
+    const db = await getDBFn()
     for (const file of req.files || []) {
       savedImages.push(await saveImage(file))
     }
@@ -293,7 +284,7 @@ router.post('/updates', requireAdmin, upload.array('images', 2), async (req, res
 
 router.get('/updates', requireAdmin, async (_req, res) => {
   try {
-    const db = await getDB()
+    const db = await getDBFn()
     const updates = await db.collection(collections.updates).find({}).sort({ createdAt: -1 }).toArray()
     res.json({ ok: true, updates })
   } catch (error) {
@@ -305,7 +296,7 @@ router.get('/updates', requireAdmin, async (_req, res) => {
 router.delete('/updates/:id', requireAdmin, async (req, res) => {
   if (!ObjectId.isValid(req.params.id)) return res.status(400).json({ ok: false, message: 'Invalid update ID' })
   try {
-    const db = await getDB()
+    const db = await getDBFn()
     const result = await db.collection(collections.updates).deleteOne({ _id: new ObjectId(req.params.id) })
     if (!result.deletedCount) return res.status(404).json({ ok: false, message: 'Update not found' })
     res.json({ ok: true, message: 'Update deleted' })
@@ -328,7 +319,7 @@ router.put('/updates/:id', requireAdmin, upload.array('images', 2), async (req, 
 
   const savedImages = []
   try {
-    const db = await getDB()
+    const db = await getDBFn()
     const collection = db.collection(collections.updates)
     const current = await collection.findOne({ _id: new ObjectId(req.params.id) })
     if (!current) return res.status(404).json({ ok: false, message: 'Update not found' })
@@ -379,4 +370,7 @@ router.use((error, _req, res, next) => {
   next(error)
 })
 
-export default router
+return router
+}
+
+export default createAdminContentRouter()

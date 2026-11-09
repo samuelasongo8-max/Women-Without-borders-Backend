@@ -9,58 +9,20 @@ import postsRouter from '../api/posts.js'
 import blogsRouter from '../api/blogs.js'
 import reportsRouter from '../api/reports.js'
 import updatesRouter from '../api/updates.js'
+import { createCorsOptions, corsErrorHandler } from '../lib/cors.js'
 
 const app = express()
 const port = Number(process.env.PORT || 4000)
-const prodOrigins = (
-  process.env.CORS_ORIGIN || ''
-)
-  .split(',')
-  .map((s) => s.trim())
-  .filter(Boolean)
+// Render terminates TLS and forwards the client address through its single
+// trusted edge proxy. Never enable this in development or trust all hops.
+app.set('trust proxy', process.env.NODE_ENV === 'production' ? 1 : false)
+const corsOptions = createCorsOptions()
 
 app.disable('x-powered-by')
-app.use(cors({
-  origin(origin, callback) {
-    if (!origin) return callback(null, true)
-
-    // Allow ANY localhost port in development
-    // This fixes the jumping port problem
-    // permanently — 3001, 3002, 3003 all work
-    const isLocalhost = /^http:\/\/localhost:\d+$/.test(origin)
-    if (isLocalhost) {
-      return callback(null, true)
-    }
-
-    // Allow your production Vercel URL
-    if (prodOrigins.includes(origin)) {
-      return callback(null, true)
-    }
-
-    console.warn('[CORS] Blocked:', origin)
-    return callback(new Error(`CORS blocked: ${origin}`))
-  },
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'Cookie'],
-}))
-app.options(/.*/, cors())
+app.use(cors(corsOptions))
+app.options(/.*/, cors(corsOptions))
 app.use(express.json({ limit: '1mb' }))
 app.use(cookieParser())
-
-// Debug logging — shows cookies on every request
-app.use((req, res, next) => {
-  console.log(
-    '[REQ]',
-    req.method,
-    req.path,
-    '| cookies:',
-    Object.keys(req.cookies || {}).length > 0
-      ? JSON.stringify(req.cookies)
-      : 'none'
-  )
-  next()
-})
 
 app.use('/api/admin', adminAuth)
 app.use('/api/admin/content', adminContent)
@@ -73,6 +35,8 @@ app.use('/uploads', express.static(fileURLToPath(new URL('../public/uploads/', i
   index: false,
 }))
 app.get('/health', (_req, res) => res.json({ ok: true }))
+
+app.use(corsErrorHandler)
 
 app.listen(port, () => {
   console.log(`[SERVER] Running on port ${port} ✅`)

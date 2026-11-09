@@ -1,12 +1,10 @@
 import express from 'express'
-import jwt from 'jsonwebtoken'
 import { ObjectId } from 'mongodb'
 import sanitizeHtml from 'sanitize-html'
 import { getDB } from '../lib/db.js'
+import { createRequireAdmin } from '../lib/adminSession.js'
 
 const router = express.Router()
-const JWT_SECRET = process.env.JWT_SECRET
-if (!JWT_SECRET) throw new Error('JWT_SECRET not set')
 
 const BLOG_CONTENT_SANITIZE_OPTIONS = {
   allowedTags: [
@@ -41,16 +39,7 @@ function hasBlogContent(value) {
   return sanitizeHtml(String(value || ''), { allowedTags: [] }).trim().length > 0
 }
 
-function requireAdmin(req, res, next) {
-  const token = req.cookies?.adminToken
-  if (!token) return res.status(401).json({ ok: false, message: 'Not authenticated' })
-  try {
-    req.admin = jwt.verify(token, JWT_SECRET)
-    next()
-  } catch {
-    res.status(401).json({ ok: false, message: 'Session expired' })
-  }
-}
+const requireAdmin = createRequireAdmin()
 
 function convertGoogleDriveUrl(url) {
   if (!url) return url
