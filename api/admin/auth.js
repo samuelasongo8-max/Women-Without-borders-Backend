@@ -9,6 +9,14 @@ import { createMongoIpRateLimiter } from '../../lib/mongoIpRateLimiter.js'
 const JWT_SECRET = process.env.JWT_SECRET
 if (!JWT_SECRET) throw new Error('JWT_SECRET not set')
 
+const MAX_ADMIN_ACCOUNTS = 3
+const MIN_ADMIN_PASSWORD_LENGTH = 12
+const MIN_REGISTRATION_KEY_BYTES = 32
+const THIRD_ADMIN_SLOT_ID = 'admin-registration-third-account'
+const THIRD_ADMIN_ACCOUNT_ID = 'owner-created-third-administrator'
+const REGISTRATION_CLAIM_LEASE_MS = 5 * 60 * 1000
+const ADMIN_ACCOUNT_LIMIT_MESSAGE = 'Administrator account limit reached. This website supports a maximum of three administrator accounts.'
+
 export function createAdminCookieOptions(nodeEnv = process.env.NODE_ENV) {
   const production = nodeEnv === 'production'
   return {
@@ -27,64 +35,193 @@ function isValidEmail(value) {
 export function createAdminAuthRouter({
   getDBFn = getDB,
   jwtSecret = JWT_SECRET,
-  privateEntryLimit = 10,
-  privateEntryWindowMs = 15 * 60 * 1000,
-  limiterNow = Date.now,
   nodeEnv = process.env.NODE_ENV,
+  now = Date.now,
+  registrationClaimLeaseMs = REGISTRATION_CLAIM_LEASE_MS,
 } = {}) {
   const router = express.Router()
   const cookieOptions = createAdminCookieOptions(nodeEnv)
+  const claimLeaseMs = Number.isFinite(registrationClaimLeaseMs) && registrationClaimLeaseMs > 0
+    ? registrationClaimLeaseMs
+    : REGISTRATION_CLAIM_LEASE_MS
   const authLimiter = createMongoIpRateLimiter({
     getDBFn,
     scope: 'admin-auth',
     limit: 5,
     windowMs: 15 * 60 * 1000,
   })
-  const privateEntryLimiter = createMongoIpRateLimiter({
-    getDBFn,
-    scope: 'admin-private-entry',
-    limit: privateEntryLimit,
-    windowMs: privateEntryWindowMs,
-    now: limiterNow,
-  })
+  router.post('/register', authLimiter, async (req, res) => {
+    let db
+    let claimId
 
-router.post('/register', authLimiter, async (req, res) => {
-  try {
-    const expectedKey = Buffer.from(process.env.ADMIN_REGISTER_KEY || '')
-    const providedKey = Buffer.from(req.get('X-Admin-Registration-Key') || '')
-    if (!expectedKey.length || expectedKey.length !== providedKey.length || !timingSafeEqual(expectedKey, providedKey)) {
-      return res.status(403).json({ ok: false, message: 'Registration is unavailable' })
+    try {
+      const expectedKey = Buffer.from(process.env.ADMIN_REGISTER_KEY || '')
+      const providedKey = Buffer.from(req.get('X-Admin-Registration-Key') || '')
+      if (
+        expectedKey.length < MIN_REGISTRATION_KEY_BYTES
+        || expectedKey.length !== providedKey.length
+        || !timingSafeEqual(expectedKey, providedKey)
+      ) {
+        return res.status(403).json({ ok: false, message: 'Registration is unavailable' })
+      }
+
+      const { email, password } = req.body || {}
+      const emailValue = typeof email === 'string' ? email.trim().toLowerCase() : ''
+      if (!emailValue || !isValidEmail(emailValue)) {
+        return res.status(400).json({ ok: false, message: 'A valid email address is required' })
+      }
+      if (typeof password !== 'string' || password.length < MIN_ADMIN_PASSWORD_LENGTH) {
+        return res.status(400).json({ ok: false, message: `Password must be at least ${MIN_ADMIN_PASSWORD_LENGTH} characters` })
+      }
+      if (bcrypt.truncates(password)) {
+        return res.status(400).json({ ok: false, message: 'Password must be 72 UTF-8 bytes or fewer' })
+      }
+
+      db = await getDBFn()
+      const admins = db.collection('admins')
+      const count = await admins.countDocuments()
+      if (count >= MAX_ADMIN_ACCOUNTS) {
+        return res.status(409).json({ ok: false, message: ADMIN_ACCOUNT_LIMIT_MESSAGE })
+      }
+      if (count !== MAX_ADMIN_ACCOUNTS - 1) {
+        return res.status(409).json({
+          ok: false,
+          message: 'Registration is available only after the two existing administrator accounts are present.',
+        })
+      }
+      if (await admins.findOne({ $or: [{ email: emailValue }, { username: emailValue }] })) {
+        return res.status(409).json({ ok: false, message: 'An account with this email already exists' })
+      }
+
+      const passwordHash = await bcrypt.hash(password, 12)
+      const registrationState = db.collection('admin_security_limits')
+
+      // This persistent guard shares the existing rate-limit collection. Its ID
+      // is not a rate-limit hash, and it has no expiresAt field for the TTL index.
+      try {
+        await registrationState.insertOne({
+          _id: THIRD_ADMIN_SLOT_ID,
+          state: 'open',
+          createdAt: new Date(),
+        })
+      } catch (error) {
+        if (error?.code !== 11000) throw error
+      }
+
+      // A claim can be abandoned by a process crash. It is recoverable after a
+      // short lease, but the fixed _id below still permits only one third admin
+      // if an old process resumes after its lease has expired.
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const claimTime = new Date(now())
+        const nextClaimId = randomUUID()
+        const claim = await registrationState.updateOne(
+          { _id: THIRD_ADMIN_SLOT_ID, state: 'open' },
+          { $set: { state: 'claimed', claimId: nextClaimId, claimedAt: claimTime } },
+        )
+        if (claim.modifiedCount === 1) {
+          claimId = nextClaimId
+          break
+        }
+
+        const [latestCount, slot] = await Promise.all([
+          admins.countDocuments(),
+          registrationState.findOne({ _id: THIRD_ADMIN_SLOT_ID }),
+        ])
+        if (latestCount >= MAX_ADMIN_ACCOUNTS || slot?.state === 'consumed') {
+          return res.status(409).json({ ok: false, message: ADMIN_ACCOUNT_LIMIT_MESSAGE })
+        }
+        if (latestCount !== MAX_ADMIN_ACCOUNTS - 1 || slot?.state !== 'claimed') {
+          return res.status(409).json({
+            ok: false,
+            message: 'The third administrator registration is already in progress or has been used.',
+          })
+        }
+
+        const claimedAt = new Date(slot.claimedAt).getTime()
+        const reclaimBefore = new Date(claimTime.getTime() - claimLeaseMs)
+        if (!Number.isFinite(claimedAt) || claimedAt > reclaimBefore.getTime()) {
+          return res.status(409).json({
+            ok: false,
+            message: 'The third administrator registration is already in progress or has been used.',
+          })
+        }
+
+        const reopened = await registrationState.updateOne(
+          { _id: THIRD_ADMIN_SLOT_ID, state: 'claimed', claimedAt: { $lte: reclaimBefore } },
+          {
+            $set: { state: 'open' },
+            $unset: { claimId: '', claimedAt: '' },
+          },
+        )
+        if (reopened.modifiedCount !== 1) {
+          return res.status(409).json({
+            ok: false,
+            message: 'The third administrator registration is already in progress or has been used.',
+          })
+        }
+      }
+
+      if (!claimId) {
+        return res.status(409).json({
+          ok: false,
+          message: 'The third administrator registration is already in progress or has been used.',
+        })
+      }
+
+      let insertedAdmin
+      try {
+        insertedAdmin = await admins.insertOne({
+          _id: THIRD_ADMIN_ACCOUNT_ID,
+          email: emailValue,
+          username: emailValue,
+          password: passwordHash,
+          createdAt: new Date(),
+        })
+      } catch (error) {
+        // Reopen only if Mongo confirms that no third account was created.
+        try {
+          const [latestCount, matchingAdmin] = await Promise.all([
+            admins.countDocuments(),
+            admins.findOne({ $or: [{ email: emailValue }, { username: emailValue }] }),
+          ])
+          if (latestCount === MAX_ADMIN_ACCOUNTS - 1 && !matchingAdmin) {
+            await registrationState.updateOne(
+              { _id: THIRD_ADMIN_SLOT_ID, state: 'claimed', claimId },
+              {
+                $set: { state: 'open' },
+                $unset: { claimId: '', claimedAt: '' },
+              },
+            )
+          }
+        } catch {
+          console.error('[AUTH] ADMIN_REGISTRATION_SLOT_RELEASE_FAILED')
+        }
+        throw error
+      }
+
+      try {
+        await registrationState.updateOne(
+          { _id: THIRD_ADMIN_SLOT_ID, state: 'claimed', claimId },
+          {
+            $set: { state: 'consumed', adminId: insertedAdmin.insertedId, consumedAt: new Date() },
+            $unset: { claimId: '' },
+          },
+        )
+      } catch {
+        // The claimed state remains closed and the account-count check is a
+        // second fail-closed guard if finalizing this marker encounters an error.
+        console.error('[AUTH] ADMIN_REGISTRATION_SLOT_FINALIZE_FAILED')
+      }
+
+      return res.status(201).json({ ok: true, message: 'Account created' })
+    } catch (error) {
+      console.error('[AUTH] ADMIN_REGISTRATION_FAILED')
+      if (error?.code === 11000) {
+        return res.status(409).json({ ok: false, message: 'An account with this email already exists' })
+      }
+      return res.status(500).json({ ok: false, message: 'Unable to complete request' })
     }
-    const { email, password } = req.body || {}
-    const emailValue = (email || '').trim().toLowerCase()
-    if (!emailValue || !isValidEmail(emailValue))
-      return res.status(400).json({ ok: false, message: 'A valid email address is required' })
-    if (typeof password !== 'string' || password.length < 8)
-      return res.status(400).json({ ok: false, message: 'Password must be at least 8 characters' })
-    if (bcrypt.truncates(password))
-      return res.status(400).json({ ok: false, message: 'Password must be 72 UTF-8 bytes or fewer' })
-
-    const db = await getDBFn()
-    const admins = db.collection('admins')
-    const count = await admins.countDocuments()
-    if (count >= 2)
-      return res.status(409).json({ ok: false, message: 'Maximum admin accounts reached' })
-    if (await admins.findOne({ $or: [{ email: emailValue }, { username: emailValue }] }))
-      return res.status(409).json({ ok: false, message: 'An account with this email already exists' })
-
-    await admins.insertOne({
-      email: emailValue,
-      username: emailValue,
-      password: await bcrypt.hash(password, 12),
-      createdAt: new Date(),
-    })
-    res.status(201).json({ ok: true, message: 'Account created' })
-  } catch (error) {
-    console.error('[AUTH] ADMIN_REGISTRATION_FAILED')
-    if (error?.code === 11000) return res.status(409).json({ ok: false, message: 'An account with this email already exists' })
-    res.status(500).json({ ok: false, message: 'Unable to complete request' })
-  }
-})
+  })
 
 router.post('/login', authLimiter, async (req, res) => {
   try {
@@ -117,21 +254,6 @@ router.post('/login', authLimiter, async (req, res) => {
     console.error('[AUTH] ADMIN_LOGIN_FAILED')
     res.status(500).json({ ok: false, message: 'Unable to complete request' })
   }
-})
-
-router.get('/private-entry-check', privateEntryLimiter, (req, res) => {
-  res.set('Cache-Control', 'no-store')
-  res.set('X-Robots-Tag', 'noindex, nofollow, noarchive')
-  const normalize = (value) => {
-    if (typeof value !== 'string' || !value.startsWith('/') || value.startsWith('//') || value.includes('?') || value.includes('#')) return ''
-    return value.replace(/\\/g, '/').replace(/\/{2,}/g, '/').replace(/\/$/, '')
-  }
-  const configuredPath = normalize(process.env.PRIVATE_ADMIN_PATH || '')
-  if (!configuredPath.startsWith('/manage/')) return res.status(404).json({ ok: false })
-  const expected = Buffer.from(configuredPath)
-  const provided = Buffer.from(normalize(req.get('X-Private-Admin-Path') || ''))
-  if (!expected.length || expected.length !== provided.length || !timingSafeEqual(expected, provided)) return res.status(404).json({ ok: false })
-  return res.json({ ok: true })
 })
 
 router.post('/logout', async (req, res) => {

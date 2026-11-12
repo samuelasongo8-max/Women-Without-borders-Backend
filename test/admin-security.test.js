@@ -1,27 +1,32 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { once } from 'node:events'
-import { randomUUID } from 'node:crypto'
 import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
 import express from 'express'
 import cookieParser from 'cookie-parser'
 
 process.env.JWT_SECRET = 'local-test-jwt-secret-not-for-production'
-process.env.PRIVATE_ADMIN_PATH = `/manage/${randomUUID()}`
-process.env.ADMIN_REGISTER_KEY = 'local-test-registration-key'
+process.env.ADMIN_REGISTER_KEY = 'local-test-registration-key-with-at-least-thirty-two-bytes'
 process.env.NODE_ENV = 'production'
 
 const { createAdminAuthRouter, createAdminCookieOptions } = await import('../api/admin/auth.js')
 const { createAdminContentRouter } = await import('../api/admin/content.js')
 
 const JWT_SECRET = process.env.JWT_SECRET
-const PASSWORD = 'local-test-password'
+const PASSWORD = 'local-test-password-for-first-admin'
+const SECOND_PASSWORD = 'local-test-password-for-second-admin'
 const admin = {
   _id: 'admin-test-id',
-  email: 'admin@example.test',
-  username: 'admin@example.test',
+  email: 'admin@test.com',
+  username: 'admin@test.com',
   password: await bcrypt.hash(PASSWORD, 4),
+}
+const secondAdmin = {
+  _id: 'second-admin-test-id',
+  email: 'samuelasongoinfoo@gmail.com',
+  username: 'samuelasongoinfoo@gmail.com',
+  password: await bcrypt.hash(SECOND_PASSWORD, 4),
 }
 
 function matchesSession(session, query) {
@@ -31,10 +36,28 @@ function matchesSession(session, query) {
   return true
 }
 
-function createFakeDatabase() {
+function matchesCounter(counter, query) {
+  if (!counter) return false
+  return Object.entries(query).every(([key, value]) => {
+    if (value && typeof value === 'object' && '$lte' in value) {
+      return new Date(counter[key]).getTime() <= new Date(value.$lte).getTime()
+    }
+    return counter[key] === value
+  })
+}
+
+function createFakeDatabase({ failNextAdminInsert = false } = {}) {
   const sessions = new Map()
   const counters = new Map()
+  const existingAdmins = [admin, secondAdmin]
   const registeredAdmins = []
+  let shouldFailAdminInsert = failNextAdminInsert
+  const sharedContent = {
+    posts: [{ _id: 'shared-post', topic: 'Existing shared post' }],
+    blogs: [],
+    reports: [{ _id: 'shared-report', reportTitle: 'Existing shared report' }],
+    community_updates: [{ _id: 'shared-update', title: 'Existing shared update' }],
+  }
   const sessionCollection = {
     async insertOne(doc) {
       if (sessions.has(doc._id)) throw new Error('duplicate session id')
@@ -54,47 +77,90 @@ function createFakeDatabase() {
     },
   }
   const counterCollection = {
-    async updateOne(query, update) {
-      const current = counters.get(query._id) || { _id: query._id, ...update.$setOnInsert, count: 0 }
-      current.count += update.$inc.count
+    async insertOne(document) {
+      if (counters.has(document._id)) {
+        const error = new Error('duplicate key')
+        error.code = 11000
+        throw error
+      }
+      counters.set(document._id, structuredClone(document))
+      return { insertedId: document._id }
+    },
+    async updateOne(query, update, options = {}) {
+      let current = counters.get(query._id)
+      if (current && !matchesCounter(current, query)) {
+        return { matchedCount: 0, modifiedCount: 0 }
+      }
+      if (!current && !options.upsert) return { matchedCount: 0, modifiedCount: 0 }
+      if (!current) current = { _id: query._id, ...(update.$setOnInsert || {}) }
+      if (update.$inc) {
+        for (const [key, value] of Object.entries(update.$inc)) current[key] = (current[key] || 0) + value
+      }
+      Object.assign(current, update.$set || {})
+      for (const key of Object.keys(update.$unset || {})) delete current[key]
       counters.set(query._id, current)
+      return { matchedCount: 1, modifiedCount: 1 }
     },
     async findOne(query) {
-      return counters.get(query._id) || null
+      const value = counters.get(query._id)
+      return matchesCounter(value, query) ? structuredClone(value) : null
     },
   }
   const adminCollection = {
     async findOne(query) {
-      if (query?.$or?.length === 3) return admin
-      const candidates = [admin, ...registeredAdmins]
-      return candidates.find((candidate) => query?.$or?.some((condition) =>
-        (condition.email && condition.email === candidate.email) ||
-        (condition.username && condition.username === candidate.username),
-      )) || null
+      const candidates = [...existingAdmins, ...registeredAdmins]
+      if (query?.$or) {
+        return candidates.find((candidate) => query.$or.some((condition) =>
+          Object.entries(condition).every(([key, value]) => candidate[key] === value),
+        )) || null
+      }
+      return candidates.find((candidate) =>
+        Object.entries(query).every(([key, value]) => candidate[key] === value),
+      ) || null
     },
-    async countDocuments() { return 1 + registeredAdmins.length },
+    async countDocuments() { return existingAdmins.length + registeredAdmins.length },
     async insertOne(document) {
-      registeredAdmins.push({ ...structuredClone(document), _id: `registered-admin-${registeredAdmins.length + 1}` })
+      if (shouldFailAdminInsert) {
+        shouldFailAdminInsert = false
+        throw new Error('synthetic insert failure')
+      }
+      const candidates = [...existingAdmins, ...registeredAdmins]
+      if (candidates.some((candidate) => candidate._id === document._id || candidate.email === document.email || candidate.username === document.username)) {
+        const error = new Error('duplicate key')
+        error.code = 11000
+        throw error
+      }
+      const registeredAdmin = { ...structuredClone(document), _id: document._id || `registered-admin-${registeredAdmins.length + 1}` }
+      registeredAdmins.push(registeredAdmin)
+      return { insertedId: registeredAdmin._id }
     },
   }
-  const emptyContentCollection = {
-    find() { return { sort() { return { toArray: async () => [] } } } },
-  }
+  const contentCollection = (name) => ({
+    find() { return { sort() { return { toArray: async () => structuredClone(sharedContent[name]) } } } },
+    async insertOne(document) {
+      const record = { ...structuredClone(document), _id: `shared-${name}-${sharedContent[name].length + 1}` }
+      sharedContent[name].push(record)
+      return { insertedId: record._id }
+    },
+  })
 
   return {
     collection(name) {
       if (name === 'admins') return adminCollection
       if (name === 'admin_sessions') return sessionCollection
       if (name === 'admin_security_limits') return counterCollection
-      if (['posts', 'blogs', 'reports', 'community_updates'].includes(name)) return emptyContentCollection
+      if (Object.hasOwn(sharedContent, name)) return contentCollection(name)
       throw new Error(`Unexpected collection: ${name}`)
     },
     sessions,
+    counters,
+    existingAdmins,
     registeredAdmins,
+    sharedContent,
   }
 }
 
-async function startApp({ privateEntryLimit = 10, database = createFakeDatabase(), limiterNow = Date.now, nodeEnv = 'production' } = {}) {
+async function startApp({ database = createFakeDatabase(), nodeEnv = 'production', authOptions = {} } = {}) {
   const app = express()
   app.set('trust proxy', 1)
   app.use(express.json())
@@ -103,10 +169,8 @@ async function startApp({ privateEntryLimit = 10, database = createFakeDatabase(
   app.use('/api/admin', createAdminAuthRouter({
     getDBFn,
     jwtSecret: JWT_SECRET,
-    privateEntryLimit,
-    privateEntryWindowMs: 15 * 60 * 1000,
-    limiterNow,
     nodeEnv,
+    ...authOptions,
   }))
   app.use('/api/admin/content', createAdminContentRouter({ getDBFn, jwtSecret: JWT_SECRET }))
 
@@ -137,7 +201,7 @@ function createFailingAdminDatabase(failurePoint, internalMessage) {
       return {
         async countDocuments() {
           if (failurePoint === 'registration') throw new Error(internalMessage)
-          return 1
+          return 2
         },
         async findOne(query) {
           if (failurePoint === 'login' && query?.$or?.length === 3) throw new Error(internalMessage)
@@ -159,47 +223,16 @@ async function captureAuthErrorLogs(callback) {
   }
 }
 
-test('wrong private path is rejected and repeated guesses receive 429', async () => {
-  let currentTime = Date.now()
-  await withApp({ privateEntryLimit: 3, limiterNow: () => currentTime }, async ({ base }) => {
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      const response = await fetch(`${base}/api/admin/private-entry-check`, {
-        headers: { 'X-Private-Admin-Path': '/manage/wrong-guess' },
-      })
-      assert.equal(response.status, 404)
-    }
-    const blocked = await fetch(`${base}/api/admin/private-entry-check`, {
-      headers: { 'X-Private-Admin-Path': process.env.PRIVATE_ADMIN_PATH },
-    })
-    assert.equal(blocked.status, 429)
-    assert.ok(Number(blocked.headers.get('retry-after')) > 0)
-
-    const otherClient = await fetch(`${base}/api/admin/private-entry-check`, {
-      headers: {
-        'X-Private-Admin-Path': '/manage/wrong-guess',
-        'X-Forwarded-For': '198.51.100.9',
-      },
-    })
-    assert.equal(otherClient.status, 404, 'a separate client IP has an independent counter')
-
-    currentTime += 15 * 60 * 1000
-    const afterCooldown = await fetch(`${base}/api/admin/private-entry-check`, {
-      headers: { 'X-Private-Admin-Path': '/manage/wrong-guess' },
-    })
-    assert.equal(afterCooldown.status, 404, 'the temporary cooldown expires after the fixed window')
-  })
-})
-
-test('the configured private path check succeeds without creating an authenticated session', async () => {
+test('invalid administrator credentials are rejected without issuing a session', async () => {
   await withApp({}, async ({ base }) => {
-    const entry = await fetch(`${base}/api/admin/private-entry-check`, {
-      headers: { 'X-Private-Admin-Path': process.env.PRIVATE_ADMIN_PATH },
+    const response = await fetch(`${base}/api/admin/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: admin.email, password: 'wrong-test-password' }),
     })
-    assert.equal(entry.status, 200)
-
-    const me = await fetch(`${base}/api/admin/me`)
-    assert.equal(me.status, 401)
-    assert.equal(me.headers.get('set-cookie'), null)
+    assert.equal(response.status, 401)
+    assert.deepEqual(await response.json(), { ok: false, message: 'Invalid credentials' })
+    assert.equal(response.headers.get('set-cookie'), null)
   })
 })
 
@@ -329,11 +362,6 @@ test('expired database sessions and Mongo failures fail closed', async () => {
   await withApp({ database: failingDatabase }, async ({ base }) => {
     const token = jwt.sign({ id: admin._id, username: admin.username, jti: 'mongo-error-session' }, JWT_SECRET, { expiresIn: '1h' })
     const cookie = `adminToken=${token}`
-    const privateCheck = await fetch(`${base}/api/admin/private-entry-check`, {
-      headers: { 'X-Private-Admin-Path': process.env.PRIVATE_ADMIN_PATH },
-    })
-    assert.equal(privateCheck.status, 503)
-
     const sessionCheck = await fetch(`${base}/api/admin/me`, { headers: { Cookie: cookie } })
     assert.equal(sessionCheck.status, 503)
 
@@ -373,15 +401,32 @@ test('registration rejects missing and incorrect registration keys', async () =>
       })
       assert.equal(response.status, 403)
     }
+
+    const savedKey = process.env.ADMIN_REGISTER_KEY
+    process.env.ADMIN_REGISTER_KEY = 'too-short-test-key'
+    try {
+      const response = await fetch(`${base}/api/admin/register`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Admin-Registration-Key': process.env.ADMIN_REGISTER_KEY,
+        },
+        body: JSON.stringify({ email: 'short-key@example.test', password: 'a-long-enough-test-password' }),
+      })
+      assert.equal(response.status, 403)
+    } finally {
+      process.env.ADMIN_REGISTER_KEY = savedKey
+    }
   })
 })
 
-test('registration accepts a correct key and a password at bcryptjs UTF-8 byte limit', async () => {
+test('the one-time registration creates exactly the third administrator and preserves both existing accounts', async () => {
   const password = '\u00e9'.repeat(36)
   assert.equal(Buffer.byteLength(password, 'utf8'), 72)
   assert.equal(bcrypt.truncates(password), false)
 
   const database = createFakeDatabase()
+  const originalAccounts = database.existingAdmins.map(({ email, username, password: hash }) => ({ email, username, hash }))
   await withApp({ database }, async ({ base }) => {
     const response = await fetch(`${base}/api/admin/register`, {
       method: 'POST',
@@ -389,13 +434,221 @@ test('registration accepts a correct key and a password at bcryptjs UTF-8 byte l
         'Content-Type': 'application/json',
         'X-Admin-Registration-Key': process.env.ADMIN_REGISTER_KEY,
       },
-      body: JSON.stringify({ email: 'new-admin@example.test', password }),
+      body: JSON.stringify({ email: 'third-admin@example.test', password }),
     })
 
     assert.equal(response.status, 201)
     assert.equal(database.registeredAdmins.length, 1)
     assert.match(database.registeredAdmins[0].password, /^\$2[ab]\$12\$/)
     assert.equal(await bcrypt.compare(password, database.registeredAdmins[0].password), true)
+    assert.deepEqual(
+      database.existingAdmins.map(({ email, username, password: hash }) => ({ email, username, hash })),
+      originalAccounts,
+    )
+    assert.equal(await database.collection('admins').countDocuments(), 3)
+    assert.equal(database.counters.get('admin-registration-third-account').state, 'consumed')
+
+    const fourth = await fetch(`${base}/api/admin/register`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Admin-Registration-Key': process.env.ADMIN_REGISTER_KEY,
+      },
+      body: JSON.stringify({ email: 'fourth-admin@example.test', password: 'another-long-test-password' }),
+    })
+    assert.equal(fourth.status, 409)
+    assert.equal((await fourth.json()).message, 'Administrator account limit reached. This website supports a maximum of three administrator accounts.')
+    assert.equal(database.registeredAdmins.length, 1)
+
+    const savedKey = process.env.ADMIN_REGISTER_KEY
+    process.env.ADMIN_REGISTER_KEY = ''
+    try {
+      const disabled = await fetch(`${base}/api/admin/register`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Admin-Registration-Key': savedKey,
+        },
+        body: JSON.stringify({ email: 'disabled-admin@example.test', password: 'another-long-test-password' }),
+      })
+      assert.equal(disabled.status, 403)
+    } finally {
+      process.env.ADMIN_REGISTER_KEY = savedKey
+    }
+  })
+})
+
+test('simultaneous authorized registrations can claim only one third-admin slot', async () => {
+  const database = createFakeDatabase()
+  await withApp({ database }, async ({ base }) => {
+    const responses = await Promise.all(['one', 'two'].map((suffix) => fetch(`${base}/api/admin/register`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Admin-Registration-Key': process.env.ADMIN_REGISTER_KEY,
+      },
+      body: JSON.stringify({ email: `concurrent-${suffix}@example.test`, password: 'a-secure-local-test-password' }),
+    })))
+
+    assert.deepEqual(responses.map((response) => response.status).sort(), [201, 409])
+    assert.equal(database.registeredAdmins.length, 1)
+    assert.equal(await database.collection('admins').countDocuments(), 3)
+  })
+})
+
+test('an abandoned third-admin claim is recovered after its lease without allowing a fourth account', async () => {
+  const database = createFakeDatabase()
+  const testNow = 1_000_000
+  database.counters.set('admin-registration-third-account', {
+    _id: 'admin-registration-third-account',
+    state: 'claimed',
+    claimId: 'abandoned-request',
+    claimedAt: new Date(testNow - 60_001),
+  })
+
+  await withApp({
+    database,
+    authOptions: { now: () => testNow, registrationClaimLeaseMs: 60_000 },
+  }, async ({ base }) => {
+    const response = await fetch(`${base}/api/admin/register`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Admin-Registration-Key': process.env.ADMIN_REGISTER_KEY,
+      },
+      body: JSON.stringify({ email: 'recovered-owner@example.test', password: 'a-secure-local-test-password' }),
+    })
+
+    assert.equal(response.status, 201)
+    assert.equal(await database.collection('admins').countDocuments(), 3)
+    assert.equal(database.registeredAdmins[0]._id, 'owner-created-third-administrator')
+    assert.equal(database.counters.get('admin-registration-third-account').state, 'consumed')
+
+    const fourth = await fetch(`${base}/api/admin/register`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Admin-Registration-Key': process.env.ADMIN_REGISTER_KEY,
+      },
+      body: JSON.stringify({ email: 'fourth-after-recovery@example.test', password: 'a-secure-local-test-password' }),
+    })
+    assert.equal(fourth.status, 409)
+    assert.equal(await database.collection('admins').countDocuments(), 3)
+  })
+})
+
+test('a failed third-admin insert releases its own claim so the owner can retry safely', async () => {
+  const database = createFakeDatabase({ failNextAdminInsert: true })
+  await withApp({ database }, async ({ base }) => {
+    const request = (email) => fetch(`${base}/api/admin/register`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Admin-Registration-Key': process.env.ADMIN_REGISTER_KEY,
+      },
+      body: JSON.stringify({ email, password: 'a-secure-local-test-password' }),
+    })
+
+    const failed = await request('retry-owner@example.test')
+    assert.equal(failed.status, 500)
+    assert.equal(await database.collection('admins').countDocuments(), 2)
+    assert.equal(database.counters.get('admin-registration-third-account').state, 'open')
+
+    const retried = await request('retry-owner@example.test')
+    assert.equal(retried.status, 201)
+    assert.equal(await database.collection('admins').countDocuments(), 3)
+    assert.equal(database.counters.get('admin-registration-third-account').state, 'consumed')
+  })
+})
+
+test('a consumed registration marker remains closed even if the database is manually altered', async () => {
+  const database = createFakeDatabase()
+  database.counters.set('admin-registration-third-account', {
+    _id: 'admin-registration-third-account',
+    state: 'consumed',
+    adminId: 'owner-created-third-administrator',
+    consumedAt: new Date(),
+  })
+
+  await withApp({ database }, async ({ base }) => {
+    const response = await fetch(`${base}/api/admin/register`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Admin-Registration-Key': process.env.ADMIN_REGISTER_KEY,
+      },
+      body: JSON.stringify({ email: 'replacement-owner@example.test', password: 'a-secure-local-test-password' }),
+    })
+    assert.equal(response.status, 409)
+    assert.equal((await response.json()).message, 'Administrator account limit reached. This website supports a maximum of three administrator accounts.')
+    assert.equal(await database.collection('admins').countDocuments(), 2)
+  })
+})
+
+test('all three administrators use the same dashboard data and can see a shared update', async () => {
+  const database = createFakeDatabase()
+  const originalAccounts = database.existingAdmins.map(({ email, username, password: hash }) => ({ email, username, hash }))
+
+  await withApp({ database }, async ({ base }) => {
+    const registration = await fetch(`${base}/api/admin/register`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Admin-Registration-Key': process.env.ADMIN_REGISTER_KEY,
+      },
+      body: JSON.stringify({ email: 'third-admin@example.test', password: 'third-admin-test-password' }),
+    })
+    assert.equal(registration.status, 201)
+
+    const credentials = [
+      { email: admin.email, password: PASSWORD },
+      { email: secondAdmin.email, password: SECOND_PASSWORD },
+      { email: 'third-admin@example.test', password: 'third-admin-test-password' },
+    ]
+    const sessions = []
+    for (const account of credentials) {
+      const login = await fetch(`${base}/api/admin/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(account),
+      })
+      assert.equal(login.status, 200)
+      sessions.push(login.headers.get('set-cookie').split(';')[0])
+    }
+
+    const routeToField = { posts: 'posts', reports: 'reports', updates: 'updates' }
+    const expectedContentIds = { posts: 'shared-post', reports: 'shared-report', updates: 'shared-update' }
+    for (const cookie of sessions) {
+      for (const [section, field] of Object.entries(routeToField)) {
+        const response = await fetch(`${base}/api/admin/content/${section}`, { headers: { Cookie: cookie } })
+        assert.equal(response.status, 200)
+        const body = await response.json()
+        assert.equal(body[field].length, 1)
+        assert.equal(body[field][0]._id, expectedContentIds[section])
+      }
+    }
+
+    const form = new FormData()
+    form.set('title', 'Shared update created by third admin')
+    form.set('update', 'A shared update stored in the common collection.')
+    const createUpdate = await fetch(`${base}/api/admin/content/updates`, {
+      method: 'POST',
+      headers: { Cookie: sessions[2] },
+      body: form,
+    })
+    assert.equal(createUpdate.status, 201)
+
+    for (const cookie of sessions.slice(0, 2)) {
+      const response = await fetch(`${base}/api/admin/content/updates`, { headers: { Cookie: cookie } })
+      assert.equal(response.status, 200)
+      const body = await response.json()
+      assert.ok(body.updates.some((item) => item.title === 'Shared update created by third admin'))
+    }
+
+    assert.deepEqual(
+      database.existingAdmins.map(({ email, username, password: hash }) => ({ email, username, hash })),
+      originalAccounts,
+    )
   })
 })
 
@@ -421,6 +674,23 @@ test('registration rejects passwords bcryptjs would truncate, including multibyt
       assert.equal(database.registeredAdmins.length, 0)
     })
   }
+})
+
+test('registration enforces a minimum 12-character password', async () => {
+  const database = createFakeDatabase()
+  await withApp({ database }, async ({ base }) => {
+    const response = await fetch(`${base}/api/admin/register`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Admin-Registration-Key': process.env.ADMIN_REGISTER_KEY,
+      },
+      body: JSON.stringify({ email: 'short-password@example.test', password: 'short-pass' }),
+    })
+    assert.equal(response.status, 400)
+    assert.equal((await response.json()).message, 'Password must be at least 12 characters')
+    assert.equal(database.registeredAdmins.length, 0)
+  })
 })
 
 test('registration database failures log only a safe event and return a generic response', async () => {
